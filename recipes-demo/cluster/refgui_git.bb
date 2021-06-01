@@ -1,6 +1,9 @@
 DESCRIPTION = "AGL Cluster Reference GUI"
-LICENSE = "MIT"
-LIC_FILES_CHKSUM = "file://LICENSE;md5=d2e73358b6893b535d5dfc7e89dc9d67"
+LICENSE = "Apache-2.0 & OFL-1.1"
+LIC_FILES_CHKSUM = " \
+           file://LICENSE;md5=5335066555b14d832335aa4660d6c376 \
+           file://LICENSE.SIL;md5=42d2b97e905f50c58574fb8149c16635 \
+"
 
 DEPENDS = " \
            qtmultimedia \
@@ -20,7 +23,7 @@ RDEPENDS_${PN} = " \
 S = "${WORKDIR}/git"
 BRANCH = "main"
 
-SRCREV = "e52dd81073154838e7f417e33debc8f6794fc683"
+SRCREV = "${AUTOREV}"
 SRC_URI = "git://github.com/agl-ic-eg/refgui;protocol=https;branch=${BRANCH}"
 
 inherit cmake cmake_qt5
