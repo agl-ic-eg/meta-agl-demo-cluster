@@ -1,0 +1,121 @@
+From 8e75b9403c90c15bb2b6466cecd4f77f038a95f5 Mon Sep 17 00:00:00 2001
+From: Hiroyuki Ishii <ishii.hiroyuki002@jp.panasonic.com>
+Date: Tue, 15 Jun 2021 10:19:56 +0900
+Subject: [PATCH] Revert "Client: Fix 100ms freeze when applications do not
+ swap after deliverUpdateRequest"
+
+This reverts commit 9f5b96225885f927727a57b6123d8550d6c373bb.
+---
+ src/client/qwaylandwindow.cpp | 46 ++++++++++++++++++++++++++++-------
+ src/client/qwaylandwindow_p.h |  1 +
+ 2 files changed, 38 insertions(+), 9 deletions(-)
+
+diff --git a/src/client/qwaylandwindow.cpp b/src/client/qwaylandwindow.cpp
+index 0df99d9f..919ab3ca 100644
+--- a/src/client/qwaylandwindow.cpp
++++ b/src/client/qwaylandwindow.cpp
+@@ -1081,6 +1081,25 @@ QVariant QWaylandWindow::property(const QString &name, const QVariant &defaultVa
+ 
+ void QWaylandWindow::timerEvent(QTimerEvent *event)
+ {
++    if (event->timerId() == mFallbackUpdateTimerId) {
++        killTimer(mFallbackUpdateTimerId);
++        mFallbackUpdateTimerId = -1;
++        qCDebug(lcWaylandBackingstore) << "mFallbackUpdateTimer timed out";
++
++        if (!isExposed()) {
++            qCDebug(lcWaylandBackingstore) << "Fallback update timer: Window not exposed,"
++                                           << "not delivering update request.";
++            return;
++        }
++
++        if (mWaitingForUpdate && hasPendingUpdateRequest() && !mWaitingForFrameCallback) {
++            qCWarning(lcWaylandBackingstore) << "Delivering update request through fallback timer,"
++                                             << "may not be in sync with display";
++            deliverUpdateRequest();
++        }
++    }
++
++
+     if (mFrameCallbackTimerId.testAndSetOrdered(event->timerId(), -1)) {
+         killTimer(event->timerId());
+         qCDebug(lcWaylandBackingstore) << "Didn't receive frame callback in time, window should now be inexposed";
+@@ -1092,7 +1111,6 @@ void QWaylandWindow::timerEvent(QTimerEvent *event)
+ 
+ void QWaylandWindow::requestUpdate()
+ {
+-    qCDebug(lcWaylandBackingstore) << "requestUpdate";
+     Q_ASSERT(hasPendingUpdateRequest()); // should be set by QPA
+ 
+     // If we have a frame callback all is good and will be taken care of there
+@@ -1100,17 +1118,20 @@ void QWaylandWindow::requestUpdate()
+         return;
+ 
+     // If we've already called deliverUpdateRequest(), but haven't seen any attach+commit/swap yet
+-    // This is a somewhat redundant behavior and might indicate a bug in the calling code, so log
+-    // here so we can get this information when debugging update/frame callback issues.
+-    // Continue as nothing happened, though.
+-    if (mWaitingForUpdate)
+-        qCDebug(lcWaylandBackingstore) << "requestUpdate called twice without committing anything";
++    if (mWaitingForUpdate) {
++        // Ideally, we should just have returned here, but we're not guaranteed that the client
++        // will actually update, so start this timer to deliver another request update after a while
++        // *IF* the client doesn't update.
++        int fallbackTimeout = 100;
++        mFallbackUpdateTimerId = startTimer(fallbackTimeout);
++        return;
++    }
+ 
+     // Some applications (such as Qt Quick) depend on updates being delivered asynchronously,
+     // so use invokeMethod to delay the delivery a bit.
+     QMetaObject::invokeMethod(this, [this] {
+         // Things might have changed in the meantime
+-        if (hasPendingUpdateRequest() && !mWaitingForFrameCallback)
++        if (hasPendingUpdateRequest() && !mWaitingForUpdate && !mWaitingForFrameCallback)
+             deliverUpdateRequest();
+     }, Qt::QueuedConnection);
+ }
+@@ -1120,7 +1141,6 @@ void QWaylandWindow::requestUpdate()
+ // Can be called from the render thread (without locking anything) so make sure to not make races in this method.
+ void QWaylandWindow::handleUpdate()
+ {
+-    qCDebug(lcWaylandBackingstore) << "handleUpdate" << QThread::currentThread();
+     // TODO: Should sync subsurfaces avoid requesting frame callbacks?
+     QReadLocker lock(&mSurfaceLock);
+     if (!mSurface)
+@@ -1131,6 +1151,15 @@ void QWaylandWindow::handleUpdate()
+         mFrameCallback = nullptr;
+     }
+ 
++    if (mFallbackUpdateTimerId != -1) {
++        // Ideally, we would stop the fallback timer here, but since we're on another thread,
++        // it's not allowed. Instead we set mFallbackUpdateTimer to -1 here, so we'll just
++        // ignore it if it times out before it's cleaned up by the invokeMethod call.
++        int id = mFallbackUpdateTimerId;
++        mFallbackUpdateTimerId = -1;
++        QMetaObject::invokeMethod(this, [this, id] { killTimer(id); }, Qt::QueuedConnection);
++    }
++
+     mFrameCallback = mSurface->frame();
+     wl_callback_add_listener(mFrameCallback, &QWaylandWindow::callbackListener, this);
+     mWaitingForFrameCallback = true;
+@@ -1150,7 +1179,6 @@ void QWaylandWindow::handleUpdate()
+ 
+ void QWaylandWindow::deliverUpdateRequest()
+ {
+-    qCDebug(lcWaylandBackingstore) << "deliverUpdateRequest";
+     mWaitingForUpdate = true;
+     QPlatformWindow::deliverUpdateRequest();
+ }
+diff --git a/src/client/qwaylandwindow_p.h b/src/client/qwaylandwindow_p.h
+index 5f15ca30..52e57c72 100644
+--- a/src/client/qwaylandwindow_p.h
++++ b/src/client/qwaylandwindow_p.h
+@@ -229,6 +229,7 @@ protected:
+ 
+     // True when we have called deliverRequestUpdate, but the client has not yet attached a new buffer
+     bool mWaitingForUpdate = false;
++    int mFallbackUpdateTimerId = -1; // Started when waiting for app to commit
+ 
+     QMutex mResizeLock;
+     bool mWaitingToApplyConfigure = false;

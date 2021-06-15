@@ -1,0 +1,93 @@
+From c41842607c557118f4c3128e3e4c18ef675ebf80 Mon Sep 17 00:00:00 2001
+From: Simon Yuan <simon.yuan@navico.com>
+Date: Thu, 7 Nov 2019 09:22:37 +1300
+Subject: [PATCH] Fix timer leak and a potential race
+
+The callback timer is now killed immediately before starting a new timer, this
+makes sure there is always a single active callback timer. It's unclear why
+killing the timer in a separate lambda doesn't always kill the timer in time,
+the hypothesis is that if killing the timer comes after starting a new one, then
+the previous timer is now left dangling. Whatever the reason is, it makes even
+more sense to kill the timer in the same lamda and immediately before starting a
+new timer anyway.
+
+Another improvement which may also be contributing to fixing the timer leak is
+changing the fallback update timer to a QAtomicInt as well.
+---
+ src/client/qwaylandwindow.cpp | 24 ++++++++++++------------
+ src/client/qwaylandwindow_p.h |  2 +-
+ 2 files changed, 13 insertions(+), 13 deletions(-)
+
+diff --git a/src/client/qwaylandwindow.cpp b/src/client/qwaylandwindow.cpp
+index 919ab3ca..dd303b3b 100644
+--- a/src/client/qwaylandwindow.cpp
++++ b/src/client/qwaylandwindow.cpp
+@@ -1081,9 +1081,8 @@ QVariant QWaylandWindow::property(const QString &name, const QVariant &defaultVa
+ 
+ void QWaylandWindow::timerEvent(QTimerEvent *event)
+ {
+-    if (event->timerId() == mFallbackUpdateTimerId) {
+-        killTimer(mFallbackUpdateTimerId);
+-        mFallbackUpdateTimerId = -1;
++    if (mFallbackUpdateTimerId.testAndSetOrdered(event->timerId(), -1)) {
++        killTimer(event->timerId());
+         qCDebug(lcWaylandBackingstore) << "mFallbackUpdateTimer timed out";
+ 
+         if (!isExposed()) {
+@@ -1123,6 +1122,9 @@ void QWaylandWindow::requestUpdate()
+         // will actually update, so start this timer to deliver another request update after a while
+         // *IF* the client doesn't update.
+         int fallbackTimeout = 100;
++        int fbuId = mFallbackUpdateTimerId.fetchAndStoreOrdered(-1);
++        if (fbuId != -1)
++            killTimer(fbuId);
+         mFallbackUpdateTimerId = startTimer(fallbackTimeout);
+         return;
+     }
+@@ -1151,12 +1153,11 @@ void QWaylandWindow::handleUpdate()
+         mFrameCallback = nullptr;
+     }
+ 
+-    if (mFallbackUpdateTimerId != -1) {
++    int id = mFallbackUpdateTimerId.fetchAndStoreOrdered(-1);
++    if (id != -1) {
+         // Ideally, we would stop the fallback timer here, but since we're on another thread,
+         // it's not allowed. Instead we set mFallbackUpdateTimer to -1 here, so we'll just
+         // ignore it if it times out before it's cleaned up by the invokeMethod call.
+-        int id = mFallbackUpdateTimerId;
+-        mFallbackUpdateTimerId = -1;
+         QMetaObject::invokeMethod(this, [this, id] { killTimer(id); }, Qt::QueuedConnection);
+     }
+ 
+@@ -1165,13 +1166,12 @@ void QWaylandWindow::handleUpdate()
+     mWaitingForFrameCallback = true;
+     mWaitingForUpdate = false;
+ 
+-    // Stop current frame timer if any, can't use killTimer directly, see comment above.
+-    int fcbId = mFrameCallbackTimerId.fetchAndStoreOrdered(-1);
+-    if (fcbId != -1)
+-        QMetaObject::invokeMethod(this, [this, fcbId] { killTimer(fcbId); }, Qt::QueuedConnection);
+-
+     // Start a timer for handling the case when the compositor stops sending frame callbacks.
+-    QMetaObject::invokeMethod(this, [this] { // Again; can't do it directly
++    // Can't use killTimer directly, see comment above.
++    QMetaObject::invokeMethod(this, [this] {
++        int fcbId = mFrameCallbackTimerId.fetchAndStoreOrdered(-1);
++        if (fcbId != -1)
++            killTimer(fcbId);
+         if (mWaitingForFrameCallback)
+             mFrameCallbackTimerId = startTimer(100);
+     }, Qt::QueuedConnection);
+diff --git a/src/client/qwaylandwindow_p.h b/src/client/qwaylandwindow_p.h
+index 52e57c72..7e40289b 100644
+--- a/src/client/qwaylandwindow_p.h
++++ b/src/client/qwaylandwindow_p.h
+@@ -229,7 +229,7 @@ protected:
+ 
+     // True when we have called deliverRequestUpdate, but the client has not yet attached a new buffer
+     bool mWaitingForUpdate = false;
+-    int mFallbackUpdateTimerId = -1; // Started when waiting for app to commit
++    QAtomicInt mFallbackUpdateTimerId = -1; // Started when waiting for app to commit
+ 
+     QMutex mResizeLock;
+     bool mWaitingToApplyConfigure = false;
